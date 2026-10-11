@@ -6638,6 +6638,26 @@ describe("POST /spawn with a worktree", () => {
    * the error has to say it is there. Otherwise the user is left wondering
    * whether to clean it up by hand.
    */
+  it("tells an explicitly named failed spawn that re-running reuses its checkout", async () => {
+    const repo = makeRepo();
+    const { internals } = createServer();
+    const tmux = withTmuxOnlyStub({ failWith: "no space left for a window" });
+    try {
+      const failed = await spawnInto(internals, {
+        agent: "claude",
+        cwd: repo,
+        worktree: { name: "kept" },
+      });
+      expect(failed.status).toBe(500);
+      const body = (await failed.json()) as { error: string };
+      expect(body.error).toContain("left in place");
+      expect(body.error).toContain("re-running the same command will reuse it");
+      expect(body.error).not.toContain("numbered sibling");
+    } finally {
+      tmux.restore();
+    }
+  });
+
   it("retries a failed derived spawn using its surviving checkout without creating a sibling", async () => {
     const repo = makeRepo();
     const prefs = spyOn(preferences, "getPreferences").mockResolvedValue({
@@ -6654,6 +6674,9 @@ describe("POST /spawn with a worktree", () => {
       });
       expect(failed.status).toBe(500);
       const body = (await failed.json()) as { error: string };
+      expect(body.error).toContain("left in place");
+      expect(body.error).toContain("re-running will create a numbered sibling");
+      expect(body.error).not.toContain("will reuse it");
       const destination = body.error.match(/--cwd '([^']+)'/)?.[1];
       expect(destination).toBeDefined();
       if (!destination) return;
@@ -7212,6 +7235,41 @@ describe("POST /spawn moving changes into a worktree", () => {
       }
     });
   }
+
+  it("refuses a Move into a parent that holds tracked files before stashing", async () => {
+    const repo = makeDirtyRepo();
+    mkdirSync(join(repo, "src"));
+    writeFileSync(join(repo, "src", "index.ts"), "export {};\n");
+    runFixtureGit(repo, "add", "src/index.ts");
+    runFixtureGit(repo, "commit", "-m", "src");
+    const excludePath = join(repo, ".git", "info", "exclude");
+    const exclude = readFileSync(excludePath, "utf8");
+    const prefs = spyOn(preferences, "getPreferences").mockResolvedValue({
+      worktree: { path: "src/{name}" },
+    });
+    const { internals } = createServer();
+    const tmux = withTmuxOnlyStub();
+    try {
+      const res = await spawnInto(internals, {
+        agent: "claude",
+        cwd: repo,
+        worktree: { name: "moved", withChanges: true },
+      });
+      const body = (await res.json()) as { error: string };
+      expect(res.status).toBe(400);
+      expect(body.error).toContain("tracked files");
+      // Refused while the source was untouched: no pane, no stash, no
+      // exclude line, and the pending edit is still in place.
+      expect(tmux.argv).toEqual([]);
+      expect(stashList(repo)).toBe("");
+      expect(dirtyPaths(repo)).toContain("M tracked.txt");
+      expect(readFileSync(excludePath, "utf8")).toBe(exclude);
+      expect(existsSync(join(repo, "src", "moved"))).toBe(false);
+    } finally {
+      prefs.mockRestore();
+      tmux.restore();
+    }
+  });
 
   it("rejects an untracked mode with no move to apply it to", async () => {
     const repo = makeDirtyRepo();
