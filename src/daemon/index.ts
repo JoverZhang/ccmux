@@ -89,6 +89,7 @@ import { AttentionTracker } from "./attention-tracker";
 import { redirectStdioToLogFile } from "./log-redirect";
 import { InvocationManager } from "./invocation-manager";
 import { Notifier, buildStateChangedPayload } from "./notifier";
+import { StatusBar } from "./status-bar";
 import { createNotifyDelivery } from "./notify-delivery";
 import { performJump, type JumpDeps } from "./notify-jump";
 import {
@@ -225,6 +226,7 @@ export class Daemon {
    * feature is gated off (no watchers, no resync, zero overhead). */
   private backgroundSource: ClaudeBackgroundSource | null = null;
   private notifier: Notifier;
+  private statusBar: StatusBar | null = null;
   /** Shared notification delivery closure (Notifier + stale-press re-notify).
    *  Set in the constructor before the server, which needs the action runner
    *  that depends on it. */
@@ -516,6 +518,8 @@ export class Daemon {
       this.copilotWatcher.ready,
     ]);
 
+    // Capture the initial scan's topology/server state without publishing yet.
+    this.statusBar = new StatusBar(this.sessionManager, preferences);
     // Initial scan - also matches existing sessions to panes
     DaemonPerf.startReporter(5);
     await this.scan();
@@ -531,6 +535,9 @@ export class Daemon {
 
     // Set up signal handlers
     this.setupSignalHandlers();
+
+    // Publish only after startup succeeds, with the initial scan's topology.
+    this.statusBar.start();
 
     this.running = true;
     console.log(`Daemon started with PID ${process.pid}`);
@@ -555,6 +562,7 @@ export class Daemon {
     await this.hookManager.stop();
     await this.backgroundSource?.stop();
     this.notifier.stop();
+    await this.statusBar?.stop();
     this.server.stop();
 
     // Remove PID file
@@ -589,6 +597,7 @@ export class Daemon {
         ProcessTree.build(),
       ]);
       const panes = paneScan.panes;
+      this.statusBar?.updatePanes(panes, paneScan.noServer !== null);
       if (paneScan.noServer) this.recordNoTmuxServer(paneScan.noServer);
 
       // Update pane cache for API response enrichment
