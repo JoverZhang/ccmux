@@ -737,13 +737,22 @@ export class LogWatcher {
     const getProcessTree = lazyProcessTree();
     const paneInfo = await findPaneByMarker(sessionId, getProcessTree);
 
+    // Several adds can be in flight for one transcript: a change event starts
+    // one per write until the session exists, and the marker re-arm and the
+    // retry below start more. All of them passed the check at the top before
+    // awaiting, so each create re-checks with no await in between, and only
+    // the first add to resume creates the session.
     if (paneInfo) {
-      this.sessionManager.createSession(
-        sessionId,
-        path,
-        "claude",
-        transcriptCwd,
-      );
+      // The marker's pane is authoritative, so it applies to a session a
+      // sibling created first, and binds one the ambiguous arm left unbound.
+      if (!this.sessionManager.hasSession(sessionId)) {
+        this.sessionManager.createSession(
+          sessionId,
+          path,
+          "claude",
+          transcriptCwd,
+        );
+      }
       this.sessionManager.setTmuxPane(sessionId, paneInfo.paneId);
       const processPid = await this.findProcessPidForPane(paneInfo.paneId);
       this.sessionManager.setPid(sessionId, marker?.pid ?? processPid ?? null);
@@ -761,6 +770,16 @@ export class LogWatcher {
       transcriptCwd,
       getProcessTree,
     );
+
+    // A sibling created the session while this add awaited. Its binding
+    // stands: this add's start-time guess must not rebind it, the replace
+    // arm must not evict another session for it, and its transcript must
+    // stay watched.
+    if (this.sessionManager.hasSession(sessionId)) {
+      this.fileOffsets.set(path, 0);
+      await this.processFile(path, sessionId);
+      return;
+    }
 
     if (decision.kind === "bound") {
       this.sessionManager.createSession(
@@ -807,12 +826,17 @@ export class LogWatcher {
     // the start-time fallback finds nothing. `handleMarkerAdded` skips a
     // path that is still watched, so unwatching here would leave the session
     // untracked until a daemon restart. Retry once with the marker instead.
-    // No await sits between this check and the unwatch, so a marker arriving
-    // after it finds the path unwatched and re-arms it the normal way.
+    // It retries at most once: the re-entered call reads `marker` before its
+    // first await, so this check is false there. No await sits between this
+    // check and the unwatch, so a marker arriving after it finds the path
+    // unwatched and re-arms it the normal way.
     if (!marker && getSessionPidMarker(sessionId)) {
       await this.handleHookBackedClaudeAdd(sessionId, path);
       return;
     }
+    // A sibling can still create the session during the replace await above.
+    // Unwatching would freeze that session's transcript.
+    if (this.sessionManager.hasSession(sessionId)) return;
     this.unwatchFile(path);
   }
 
