@@ -23,8 +23,9 @@ import type {
   ResultLogEntry,
   SummaryLogEntry,
   SystemLogEntry,
+  ToolResultContent,
 } from "../types";
-import type { Session } from "../types/session";
+import type { Session, SessionState } from "../types/session";
 
 describe("status-machine", () => {
   let testCwd: string;
@@ -1404,6 +1405,255 @@ describe("status-machine", () => {
         state = processEntry(entry, state);
       }).not.toThrow();
       expect(state.prompts).toEqual([]);
+    });
+  });
+
+  // Issue #233. Shapes copied from real Claude Code 2.1.296 transcripts.
+  describe("processUserEntry - Claude bookkeeping runs no turn", () => {
+    const CAVEAT =
+      "<local-command-caveat>The command below was run directly in Claude Code, not sent to you as a request, and its output goes straight to the user. It's recorded here as context for later messages.</local-command-caveat>";
+
+    const userEntry = (
+      content: UserLogEntry["message"]["content"],
+      timestamp: string,
+      isMeta?: boolean,
+    ): UserLogEntry => ({
+      type: "user",
+      uuid: timestamp,
+      parentUuid: null,
+      timestamp,
+      ...(isMeta === undefined ? {} : { isMeta }),
+      message: { role: "user", content },
+    });
+
+    // `UserMessage` models array content as tool results only; isMeta
+    // entries also carry plain text blocks there.
+    const textBlocks = (text: string) =>
+      [{ type: "text", text }] as unknown as ToolResultContent[];
+
+    const localCommand = (name: string, args = ""): string =>
+      `<command-name>/${name}</command-name>\n            <command-message>${name}</command-message>\n            <command-args>${args}</command-args>`;
+
+    /** A session whose last turn finished: idle, already prompted once. */
+    const afterTurn = (): SessionState => ({
+      ...createInitialState(),
+      lastActivityAt: "2024-01-01T12:00:00Z",
+      lastUserInputAt: "2024-01-01T11:59:00Z",
+      lastPrompt: "fix the failing test",
+      prompts: ["fix the failing test"],
+    });
+
+    const apply = (state: SessionState, entries: LogEntry[]): SessionState =>
+      entries.reduce((s, e) => processEntry(e, s), state);
+
+    it("derives idle from the transcript /clear writes for the new session", () => {
+      // Written the moment /clear runs, before any prompt. The daemon creates
+      // the new session from exactly this file, and a `working` here became a
+      // working -> idle edge that marked the row unread.
+      const state = deriveStateFromEntries([
+        userEntry(CAVEAT, "2024-01-01T12:01:00.825Z", true),
+        userEntry(localCommand("clear"), "2024-01-01T12:01:00.788Z"),
+        {
+          type: "system",
+          uuid: "s1",
+          parentUuid: null,
+          timestamp: "2024-01-01T12:01:00.821Z",
+          subtype: "local_command",
+        } as SystemLogEntry,
+      ]);
+
+      expect(state.status).toBe("idle");
+      expect(state.lastPrompt).toBeUndefined();
+      expect(state.prompts).toBeUndefined();
+      expect(state.lastUserInputAt).toBeUndefined();
+    });
+
+    it("leaves an idle session idle through a local command and its output", () => {
+      const before = afterTurn();
+      const state = apply(before, [
+        userEntry(CAVEAT, "2024-01-01T12:01:00Z", true),
+        userEntry(localCommand("model", "haiku"), "2024-01-01T12:01:00Z"),
+        userEntry(
+          "<local-command-stdout>Set model to `Haiku 5.5`</local-command-stdout>",
+          "2024-01-01T12:01:00Z",
+        ),
+      ]);
+
+      expect(state.status).toBe("idle");
+      expect(state.lastPrompt).toBe(before.lastPrompt);
+      expect(state.prompts).toEqual(before.prompts);
+      expect(state.lastUserInputAt).toBe(before.lastUserInputAt);
+      // Not bumped: the cascade reads this as the log's freshness, and these
+      // entries say nothing about status.
+      expect(state.lastActivityAt).toBe(before.lastActivityAt);
+    });
+
+    it("starts a turn on a `!` shell command, which Claude answers", () => {
+      const state = processEntry(
+        userEntry("<bash-input>echo hi</bash-input>", "2024-01-01T12:01:00Z"),
+        afterTurn(),
+      );
+
+      expect(state.status).toBe("working");
+    });
+
+    it("leaves an idle session idle through an isMeta text array", () => {
+      // A plugin's notice injected between turns, which used to fall into the
+      // tool-result branch and read as work resuming.
+      const state = processEntry(
+        userEntry(
+          textBlocks("git-sync: pulled 3 commits"),
+          "2024-01-01T12:01:00Z",
+          true,
+        ),
+        afterTurn(),
+      );
+
+      expect(state.status).toBe("idle");
+    });
+
+    // An injected entry that Claude answers with a turn of only thinking and
+    // text: no tool_use to establish `working` and no enqueue, so the entry
+    // itself is the only working signal before the end_turn.
+    it.each([
+      [
+        "a cross-session message",
+        'Another Claude session sent a message:\n<cross-session-message from="council:reviewer">LGTM</cross-session-message>',
+      ],
+      [
+        "a coordinator message",
+        "The coordinator sent a message while you were working:\nThe usage limit has reset. Continue where you left off.",
+      ],
+      [
+        "a background-task notification",
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.",
+      ],
+      [
+        "stop-hook feedback",
+        "Stop hook feedback:\ngit-sync: this turn left 1 file uncommitted (README.md). Verify, then commit and push, or say why not.",
+      ],
+    ])("runs a text-only turn started by %s", (_label, content) => {
+      const before = afterTurn();
+      const assistant = (
+        block: AssistantLogEntry["message"]["content"][number],
+        timestamp: string,
+        stop_reason?: string,
+      ): AssistantLogEntry => ({
+        type: "assistant",
+        uuid: timestamp,
+        parentUuid: null,
+        timestamp,
+        message: { role: "assistant", content: [block], stop_reason },
+      });
+
+      const injected = processEntry(
+        userEntry(content, "2024-01-01T12:01:00Z", true),
+        before,
+      );
+      const thinking = processEntry(
+        assistant(
+          { type: "thinking", thinking: "Nothing to change." } as {
+            type: string;
+          },
+          "2024-01-01T12:01:02Z",
+        ),
+        injected,
+      );
+      const done = processEntry(
+        assistant(
+          { type: "text", text: "Nothing left to do." },
+          "2024-01-01T12:01:03Z",
+          "end_turn",
+        ),
+        thinking,
+      );
+
+      // working -> idle is the edge AttentionTracker reads as a finished,
+      // unread response.
+      expect([injected.status, thinking.status, done.status]).toEqual([
+        "working",
+        "working",
+        "idle",
+      ]);
+      expect(injected.lastActivityAt).toBe("2024-01-01T12:01:00Z");
+      // Not the user's words.
+      expect(injected.lastPrompt).toBe(before.lastPrompt);
+      expect(injected.prompts).toEqual(before.prompts);
+      expect(injected.lastUserInputAt).toBe(before.lastUserInputAt);
+    });
+
+    it("keeps a pending plan/question wait through an injected entry", () => {
+      const waiting: SessionState = {
+        ...afterTurn(),
+        status: "waiting",
+        attentionType: "plan_approval",
+        pendingTool: "ExitPlanMode",
+        pendingToolIds: ["plan-1"],
+        inPlanMode: true,
+      };
+      const state = processEntry(
+        userEntry(
+          "The coordinator sent a message while you were working:\nhurry up",
+          "2024-01-01T12:01:00Z",
+          true,
+        ),
+        waiting,
+      );
+
+      expect(state.status).toBe("waiting");
+      expect(state.attentionType).toBe("plan_approval");
+      expect(state.pendingToolIds).toEqual(["plan-1"]);
+      expect(state.inPlanMode).toBe(true);
+    });
+
+    it("keeps a pending plan/question wait through bookkeeping", () => {
+      const waiting: SessionState = {
+        ...afterTurn(),
+        status: "waiting",
+        attentionType: "plan_approval",
+        pendingTool: "ExitPlanMode",
+        pendingToolIds: ["plan-1"],
+        inPlanMode: true,
+      };
+      const state = processEntry(
+        userEntry(CAVEAT, "2024-01-01T12:01:00Z", true),
+        waiting,
+      );
+
+      expect(state.status).toBe("waiting");
+      expect(state.pendingTool).toBe("ExitPlanMode");
+      expect(state.pendingToolIds).toEqual(["plan-1"]);
+      expect(state.inPlanMode).toBe(true);
+    });
+
+    it("starts a turn on a prompt-type slash command and records it as the prompt", () => {
+      const record =
+        "<command-message>git-workflow:review-pr</command-message>\n<command-name>/git-workflow:review-pr</command-name>\n<command-args>https://github.com/epilande/ccmux/pull/1</command-args>";
+      const state = apply(afterTurn(), [
+        userEntry(record, "2024-01-01T12:01:00Z"),
+        // The expanded prompt that follows, isMeta and array-shaped.
+        userEntry(
+          textBlocks("Review the PR above."),
+          "2024-01-01T12:01:00Z",
+          true,
+        ),
+      ]);
+
+      expect(state.status).toBe("working");
+      expect(state.lastPrompt).toBe(record);
+      expect(state.prompts).toEqual(["fix the failing test", record]);
+      expect(state.lastUserInputAt).toBe("2024-01-01T12:01:00Z");
+    });
+
+    it("still starts a turn on a prompt that quotes a tag mid-text", () => {
+      const prompt = "why does <command-name>/clear</command-name> go unread?";
+      const state = processEntry(
+        userEntry(prompt, "2024-01-01T12:01:00Z"),
+        afterTurn(),
+      );
+
+      expect(state.status).toBe("working");
+      expect(state.lastPrompt).toBe(prompt);
     });
   });
 });
